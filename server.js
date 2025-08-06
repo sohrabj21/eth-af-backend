@@ -1,4 +1,4 @@
-// server.js - Enhanced backend with better token detection
+// server.js - Enhanced backend with DEX price fetching for ALL tokens
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -9,8 +9,9 @@ require('dotenv').config();
 const app = express();
 const PORT = parseInt(process.env.PORT) || 3000;
 
-// Initialize cache (TTL: 5 minutes)
+// Initialize cache (TTL: 5 minutes for data, 1 minute for prices)
 const cache = new NodeCache({ stdTTL: 300 });
+const priceCache = new NodeCache({ stdTTL: 60 });
 
 // Railway/Render configuration
 app.set('trust proxy', true);
@@ -43,7 +44,8 @@ const chainConfigs = {
         explorerApi: 'https://api.etherscan.io/api',
         nativeCurrency: 'ETH',
         alchemyPrefix: 'eth-mainnet',
-        coingeckoId: 'ethereum'
+        coingeckoId: 'ethereum',
+        oneInchId: 1
     },
     base: { 
         id: 8453, 
@@ -55,7 +57,8 @@ const chainConfigs = {
         explorerApi: 'https://api.basescan.org/api', 
         nativeCurrency: 'ETH',
         alchemyPrefix: 'base-mainnet',
-        coingeckoId: 'base'
+        coingeckoId: 'base',
+        oneInchId: 8453
     }
 };
 
@@ -96,6 +99,111 @@ async function getCachedData(key, fetchFunction, ttl = 300) {
 }
 
 // ============================================
+// DEX Price Fetching
+// ============================================
+
+// Get token prices from 1inch API (works for ANY token with liquidity)
+async function getDexTokenPrice(tokenAddress, chainId = 1) {
+    const cacheKey = `dex_price_${chainId}_${tokenAddress}`;
+    const cached = priceCache.get(cacheKey);
+    if (cached) return cached;
+    
+    try {
+        // 1inch Price API - no API key needed!
+        const url = `https://api.1inch.io/v5.0/${chainId}/quote`;
+        
+        // Get price by comparing to USDC (1M USDC as base)
+        const usdcAddress = chainId === 1 
+            ? '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48' // USDC on Ethereum
+            : '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913'; // USDC on Base
+        
+        const decimals = 18; // Most tokens use 18 decimals
+        const amount = ethers.parseUnits('1', decimals).toString();
+        
+        const response = await axios.get(url, {
+            params: {
+                fromTokenAddress: tokenAddress,
+                toTokenAddress: usdcAddress,
+                amount: amount
+            },
+            headers: {
+                'Accept': 'application/json'
+            },
+            timeout: 5000
+        });
+        
+        if (response.data && response.data.toTokenAmount) {
+            // Convert to price per token
+            const price = parseFloat(ethers.formatUnits(response.data.toTokenAmount, 6)); // USDC has 6 decimals
+            priceCache.set(cacheKey, price);
+            return price;
+        }
+    } catch (error) {
+        // Token might not have liquidity on 1inch, try alternative
+        console.log(`1inch price not found for ${tokenAddress}, trying alternatives...`);
+    }
+    
+    // Try DexScreener as backup
+    try {
+        const dexScreenerUrl = `https://api.dexscreener.com/latest/dex/tokens/${tokenAddress}`;
+        const response = await axios.get(dexScreenerUrl, { timeout: 5000 });
+        
+        if (response.data && response.data.pairs && response.data.pairs.length > 0) {
+            // Get the price from the pair with most liquidity
+            const bestPair = response.data.pairs.sort((a, b) => 
+                (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0)
+            )[0];
+            
+            if (bestPair && bestPair.priceUsd) {
+                const price = parseFloat(bestPair.priceUsd);
+                priceCache.set(cacheKey, price);
+                return price;
+            }
+        }
+    } catch (error) {
+        console.log(`DexScreener price not found for ${tokenAddress}`);
+    }
+    
+    return 0; // No price found
+}
+
+// Get prices for multiple tokens efficiently
+async function getTokenPricesWithDex(tokens) {
+    const prices = {};
+    
+    // First, get common token prices from CoinGecko
+    const commonPrices = await getCommonTokenPrices();
+    
+    // Then, for each token, try to get price
+    const pricePromises = tokens.map(async (token) => {
+        const symbol = token.symbol?.toUpperCase();
+        
+        // Check if we have a common price first
+        if (commonPrices[symbol]) {
+            prices[symbol] = commonPrices[symbol];
+            return;
+        }
+        
+        // If we have a contract address, get DEX price
+        if (token.contractAddress && !token.isNative) {
+            const chainId = token.chain === 'base' ? 8453 : 1;
+            const dexPrice = await getDexTokenPrice(token.contractAddress, chainId);
+            if (dexPrice > 0) {
+                prices[symbol] = dexPrice;
+                console.log(`✅ Found DEX price for ${symbol}: $${dexPrice}`);
+            }
+        }
+    });
+    
+    await Promise.all(pricePromises);
+    
+    // Add native token prices
+    prices['ETH'] = commonPrices['ETH'] || 2000;
+    
+    return prices;
+}
+
+// ============================================
 // API Routes
 // ============================================
 
@@ -103,13 +211,13 @@ async function getCachedData(key, fetchFunction, ttl = 300) {
 app.get('/', (req, res) => {
     res.status(200).json({ 
         status: 'online',
-        message: '🚀 eth.af API v4.0 is running!',
+        message: '🚀 eth.af API v5.0 with DEX pricing!',
         features: [
-            '💎 ALL ERC-20 tokens with prices',
-            '🌐 Ethereum + Base L2 support',
+            '💎 ALL token prices via DEX',
+            '🌐 Ethereum + Base L2',
+            '📈 Real-time DEX prices',
             '🖼️ NFT floor prices',
-            '📊 Transaction activity',
-            '🎨 Fun & fast'
+            '📊 Transaction activity'
         ]
     });
 });
@@ -122,7 +230,7 @@ app.get('/api/health', (req, res) => {
     });
 });
 
-// Main wallet endpoint
+// Main wallet endpoint with DEX pricing
 app.get('/api/wallet/:addressOrEns', async (req, res) => {
     try {
         let address = req.params.addressOrEns;
@@ -153,60 +261,53 @@ app.get('/api/wallet/:addressOrEns', async (req, res) => {
             getRecentActivity(address)
         ]);
         
-        // Get prices for all unique tokens
-        const allTokenSymbols = new Set();
-        [...ethereumTokens, ...baseTokens].forEach(token => {
-            if (token.symbol) allTokenSymbols.add(token.symbol.toUpperCase());
-        });
+        // Combine all tokens for price fetching
+        const allTokensRaw = [...ethereumTokens, ...baseTokens];
         
-        const prices = await getTokenPricesForSymbols(Array.from(allTokenSymbols));
+        console.log(`💰 Fetching prices for ${allTokensRaw.length} tokens...`);
+        
+        // Get prices for ALL tokens using DEX data
+        const prices = await getTokenPricesWithDex(allTokensRaw);
         
         // Process tokens with accurate pricing
         const allTokens = [];
         let totalValue = 0;
         
-        // Process Ethereum tokens
-        ethereumTokens.forEach(token => {
-            const price = prices[token.symbol?.toUpperCase()] || 0;
-            const usdValue = parseFloat(token.balance || 0) * price;
+        // Process all tokens with their prices
+        allTokensRaw.forEach(token => {
+            const symbol = token.symbol?.toUpperCase();
+            const price = prices[symbol] || 0;
+            const balance = parseFloat(token.balance || 0);
+            const usdValue = balance * price;
             
-            // Only include if balance is significant
-            if (parseFloat(token.balance) > 0.000001 || usdValue > 0.01) {
+            // Include token if it has balance (even if price is 0)
+            if (balance > 0.000001) {
                 totalValue += usdValue;
+                
+                const chainEmoji = token.chain === 'base' ? '🔵' : '🟦';
+                const chainColor = token.chain === 'base' ? '#0052FF' : '#627EEA';
+                
                 allTokens.push({
                     ...token,
-                    chain: 'ethereum',
-                    chainEmoji: '🟦',
-                    chainColor: '#627EEA',
+                    chainEmoji,
+                    chainColor,
                     price,
                     usdValue,
-                    displayBalance: formatTokenBalance(token.balance, token.symbol)
+                    displayBalance: formatTokenBalance(balance, symbol),
+                    hasPrice: price > 0
                 });
             }
         });
         
-        // Process Base tokens
-        baseTokens.forEach(token => {
-            const price = prices[token.symbol?.toUpperCase()] || 0;
-            const usdValue = parseFloat(token.balance || 0) * price;
-            
-            // Only include if balance is significant
-            if (parseFloat(token.balance) > 0.000001 || usdValue > 0.01) {
-                totalValue += usdValue;
-                allTokens.push({
-                    ...token,
-                    chain: 'base',
-                    chainEmoji: '🔵',
-                    chainColor: '#0052FF',
-                    price,
-                    usdValue,
-                    displayBalance: formatTokenBalance(token.balance, token.symbol)
-                });
-            }
+        // Sort by USD value (tokens with value first, then by balance)
+        allTokens.sort((a, b) => {
+            if (a.usdValue > 0 && b.usdValue === 0) return -1;
+            if (a.usdValue === 0 && b.usdValue > 0) return 1;
+            if (a.usdValue !== b.usdValue) return b.usdValue - a.usdValue;
+            return parseFloat(b.balance) - parseFloat(a.balance);
         });
         
-        // Sort by USD value
-        allTokens.sort((a, b) => b.usdValue - a.usdValue);
+        console.log(`✅ Wallet data ready: ${allTokens.length} tokens, $${totalValue.toFixed(2)} total`);
         
         res.status(200).json({
             address,
@@ -234,7 +335,7 @@ app.get('/api/wallet/:addressOrEns', async (req, res) => {
     }
 });
 
-// Get ALL tokens for a specific chain with better detection
+// Get ALL tokens for a specific chain
 async function getAllTokensForChain(address, chain) {
     const cacheKey = `all_tokens_${chain}_${address}`;
     
@@ -249,7 +350,7 @@ async function getAllTokensForChain(address, chain) {
                 return [];
             }
             
-            // IMPORTANT: Get native ETH balance for EACH chain separately
+            // Get native ETH balance for this specific chain
             console.log(`💰 Getting ETH balance on ${chain}...`);
             const ethBalance = await provider.getBalance(address);
             const formattedEthBalance = ethers.formatEther(ethBalance);
@@ -263,20 +364,20 @@ async function getAllTokensForChain(address, chain) {
                     decimals: 18,
                     logo: 'https://cryptologos.cc/logos/ethereum-eth-logo.png',
                     isNative: true,
-                    chain: chain
+                    chain: chain,
+                    contractAddress: null
                 });
             }
             
-            // Get ALL ERC-20 tokens using Alchemy's comprehensive method
+            // Get ALL ERC-20 tokens
             const alchemyUrl = `https://${config.alchemyPrefix}.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`;
             
             console.log(`🔍 Fetching all ERC-20 tokens on ${chain}...`);
             
-            // Use alchemy_getTokenBalances to get ALL tokens
             const response = await axios.post(alchemyUrl, {
                 jsonrpc: '2.0',
                 method: 'alchemy_getTokenBalances',
-                params: [address, 'erc20'], // Specify ERC20 tokens
+                params: [address, 'erc20'],
                 id: 1
             });
             
@@ -289,7 +390,7 @@ async function getAllTokensForChain(address, chain) {
                 
                 console.log(`📊 Found ${tokenBalances.length} tokens with balance on ${chain}`);
                 
-                // Batch fetch metadata for better performance
+                // Fetch metadata for each token
                 const metadataPromises = tokenBalances.map(async (tokenBalance) => {
                     try {
                         const metadataResponse = await axios.post(alchemyUrl, {
@@ -306,21 +407,19 @@ async function getAllTokensForChain(address, chain) {
                         const decimals = metadata.decimals || 18;
                         const formattedBalance = ethers.formatUnits(balance, decimals);
                         
-                        // Skip dust amounts
-                        if (parseFloat(formattedBalance) < 0.000001) return null;
-                        
+                        // Include even tiny amounts - we'll filter later
                         return {
                             name: metadata.name || 'Unknown Token',
                             symbol: metadata.symbol || 'UNKNOWN',
                             balance: formattedBalance,
                             decimals: decimals,
-                            logo: metadata.logo || `https://raw.githubusercontent.com/trustwallet/assets/master/blockchains/${chain}/assets/${tokenBalance.contractAddress}/logo.png`,
+                            logo: metadata.logo || '',
                             contractAddress: tokenBalance.contractAddress,
                             isNative: false,
                             chain: chain
                         };
                     } catch (error) {
-                        console.error(`⚠️ Error fetching metadata for ${tokenBalance.contractAddress}`);
+                        console.error(`⚠️ Metadata error for ${tokenBalance.contractAddress}`);
                         return null;
                     }
                 });
@@ -336,39 +435,7 @@ async function getAllTokensForChain(address, chain) {
             console.error(`❌ Error fetching ${chain} tokens:`, error.message);
             return [];
         }
-    });
-}
-
-// Get token prices for specific symbols (including obscure tokens)
-async function getTokenPricesForSymbols(symbols) {
-    try {
-        console.log(`💵 Fetching prices for ${symbols.length} tokens...`);
-        
-        // First try CoinGecko for common tokens
-        const commonPrices = await getCommonTokenPrices();
-        
-        // For tokens not in common prices, try to fetch from DEX aggregators
-        const missingSymbols = symbols.filter(s => !commonPrices[s]);
-        
-        if (missingSymbols.length > 0) {
-            console.log(`🔍 Looking up ${missingSymbols.length} additional token prices...`);
-            // You could add DEX price lookups here via 1inch API or Uniswap
-        }
-        
-        // Add some specific token prices that we know
-        const knownPrices = {
-            ...commonPrices,
-            'WOLF': 0.000045, // Example price for WOLF token
-            'PREDI': 0.00515,  // Example price for PREDI token
-            // Add more known token prices here
-        };
-        
-        return knownPrices;
-        
-    } catch (error) {
-        console.error('Price fetch error:', error);
-        return {};
-    }
+    }, 300); // Cache for 5 minutes
 }
 
 // Get common token prices from CoinGecko
@@ -377,16 +444,15 @@ async function getCommonTokenPrices() {
     
     return getCachedData(cacheKey, async () => {
         try {
-            // Comprehensive list of tokens
             const tokenList = [
                 'ethereum', 'wrapped-bitcoin', 'tether', 'usd-coin', 'dai',
                 'chainlink', 'uniswap', 'aave', 'curve-dao-token', 'maker',
                 'compound-governance-token', 'sushi', 'the-graph', '1inch',
-                'matic-network', 'arbitrum', 'optimism', 'lido-dao', 'rocket-pool',
-                'frax-share', 'convex-finance', 'yearn-finance', 'balancer',
-                'ape-coin', 'the-sandbox', 'decentraland', 'axie-infinity',
-                'immutable-x', 'gala', 'enjincoin', 'render-token', 'blur',
-                'shiba-inu', 'pepe', 'floki', 'bone-shibaswap'
+                'matic-network', 'arbitrum', 'optimism', 'lido-dao',
+                'rocket-pool', 'frax-share', 'convex-finance', 'yearn-finance',
+                'balancer', 'ape-coin', 'the-sandbox', 'decentraland',
+                'axie-infinity', 'immutable-x', 'gala', 'enjincoin',
+                'render-token', 'blur', 'shiba-inu', 'pepe', 'floki'
             ];
             
             const url = 'https://api.coingecko.com/api/v3/simple/price';
@@ -394,10 +460,11 @@ async function getCommonTokenPrices() {
                 params: {
                     ids: tokenList.join(','),
                     vs_currencies: 'usd'
-                }
+                },
+                timeout: 5000
             });
             
-            // Map to token symbols
+            // Map to symbols
             const priceMap = {
                 'ETH': response.data.ethereum?.usd || 2000,
                 'WETH': response.data.ethereum?.usd || 2000,
@@ -434,22 +501,19 @@ async function getCommonTokenPrices() {
                 'BLUR': response.data.blur?.usd || 0.3,
                 'SHIB': response.data['shiba-inu']?.usd || 0.000008,
                 'PEPE': response.data.pepe?.usd || 0.0000001,
-                'FLOKI': response.data.floki?.usd || 0.00003,
-                'BONE': response.data['bone-shibaswap']?.usd || 0.5
+                'FLOKI': response.data.floki?.usd || 0.00003
             };
             
             return priceMap;
             
         } catch (error) {
-            console.error('CoinGecko API error:', error);
-            return {
-                'ETH': 2000, 'USDC': 1, 'USDT': 1, 'DAI': 1
-            };
+            console.error('CoinGecko error:', error);
+            return { 'ETH': 2000, 'USDC': 1, 'USDT': 1, 'DAI': 1 };
         }
-    }, 300); // Cache for 5 minutes
+    }, 60); // Cache for 1 minute
 }
 
-// Get recent activity (transactions)
+// Get recent activity
 async function getRecentActivity(address) {
     const cacheKey = `activity_${address}`;
     
@@ -457,13 +521,17 @@ async function getRecentActivity(address) {
         try {
             console.log('📊 Fetching recent activity...');
             
-            // Fetch recent transactions from Etherscan
-            const etherscanUrl = `${chainConfigs.ethereum.explorerApi}?module=account&action=txlist&address=${address}&startblock=0&endblock=99999999&page=1&offset=20&sort=desc&apikey=${process.env.ETHERSCAN_API_KEY}`;
+            // Fetch from Etherscan
+            if (!process.env.ETHERSCAN_API_KEY) {
+                return [];
+            }
             
-            const response = await axios.get(etherscanUrl);
+            const url = `https://api.etherscan.io/api?module=account&action=txlist&address=${address}&startblock=0&endblock=99999999&page=1&offset=20&sort=desc&apikey=${process.env.ETHERSCAN_API_KEY}`;
+            
+            const response = await axios.get(url, { timeout: 5000 });
             
             if (response.data.status === '1' && response.data.result) {
-                const transactions = response.data.result.slice(0, 10); // Get last 10 transactions
+                const transactions = response.data.result.slice(0, 10);
                 
                 return transactions.map(tx => ({
                     hash: tx.hash,
@@ -481,7 +549,7 @@ async function getRecentActivity(address) {
             return [];
             
         } catch (error) {
-            console.error('Activity fetch error:', error);
+            console.error('Activity error:', error);
             return [];
         }
     }, 60); // Cache for 1 minute
@@ -493,18 +561,17 @@ async function getEnhancedNFTsWithFloorPrices(address) {
     
     return getCachedData(cacheKey, async () => {
         try {
-            console.log('🎨 Fetching NFT collections with floor prices...');
+            console.log('🎨 Fetching NFT collections...');
             
-            // Fetch NFTs from Alchemy
             const url = `https://eth-mainnet.g.alchemy.com/nft/v3/${process.env.ALCHEMY_API_KEY}/getNFTsForOwner`;
             
             const response = await axios.get(url, {
                 params: {
                     owner: address,
                     withMetadata: true,
-                    pageSize: 100,
-                    orderBy: 'transferTime'
-                }
+                    pageSize: 100
+                },
+                timeout: 10000
             });
             
             const collections = {};
@@ -520,22 +587,18 @@ async function getEnhancedNFTsWithFloorPrices(address) {
                             symbol: nft.contract.symbol || '',
                             address: nft.contract.address,
                             nfts: [],
-                            floorPrice: 0, // Will be fetched separately
-                            totalSupply: nft.contract.totalSupply,
+                            floorPrice: 0,
                             chain: 'ethereum'
                         };
                     }
                     
-                    // Get the best available image
                     let imageUrl = nft.image?.cachedUrl || 
                                   nft.image?.thumbnailUrl || 
                                   nft.image?.pngUrl ||
                                   nft.image?.originalUrl ||
                                   nft.media?.[0]?.gateway ||
-                                  nft.media?.[0]?.thumbnail ||
                                   '';
                     
-                    // Handle IPFS URLs
                     if (imageUrl && imageUrl.startsWith('ipfs://')) {
                         imageUrl = `https://ipfs.io/ipfs/${imageUrl.slice(7)}`;
                     }
@@ -544,14 +607,12 @@ async function getEnhancedNFTsWithFloorPrices(address) {
                         name: nft.name || nft.title || `${nft.contract.symbol} #${nft.tokenId}`,
                         tokenId: nft.tokenId,
                         image: imageUrl,
-                        description: nft.description,
-                        hasImage: !!imageUrl,
-                        attributes: nft.raw?.metadata?.attributes || []
+                        hasImage: !!imageUrl
                     });
                 });
             }
             
-            // Sort NFTs within each collection (images first, then no images)
+            // Sort NFTs within collections
             Object.values(collections).forEach(collection => {
                 collection.nfts.sort((a, b) => {
                     if (a.hasImage && !b.hasImage) return -1;
@@ -560,39 +621,38 @@ async function getEnhancedNFTsWithFloorPrices(address) {
                 });
             });
             
-            // Try to fetch floor prices for collections
+            // Get floor prices from Alchemy
             const collectionsArray = Object.values(collections);
             
-            // For now, add estimated floor prices (in production, fetch from OpenSea API)
-            collectionsArray.forEach(collection => {
-                // These would be fetched from OpenSea or another NFT pricing API
-                const knownFloorPrices = {
-                    'Bored Ape Yacht Club': 30,
-                    'Mutant Ape Yacht Club': 5,
-                    'Azuki': 10,
-                    'Doodles': 3,
-                    'Cool Cats': 1,
-                    'World of Women': 2,
-                    'CryptoPunks': 50
-                };
-                
-                collection.floorPrice = knownFloorPrices[collection.name] || 0;
-            });
+            for (const collection of collectionsArray) {
+                try {
+                    const floorResponse = await axios.post(
+                        `https://eth-mainnet.g.alchemy.com/nft/v3/${process.env.ALCHEMY_API_KEY}/getFloorPrice`,
+                        { contractAddress: collection.address },
+                        { timeout: 5000 }
+                    );
+                    
+                    if (floorResponse.data && floorResponse.data.openSea?.floorPrice) {
+                        collection.floorPrice = floorResponse.data.openSea.floorPrice;
+                    }
+                } catch (error) {
+                    // Floor price not available
+                }
+            }
             
-            // Sort collections by floor price (highest first)
-            collectionsArray.sort((a, b) => b.floorPrice - a.floorPrice);
+            // Sort by floor price
+            collectionsArray.sort((a, b) => (b.floorPrice || 0) - (a.floorPrice || 0));
             
-            console.log(`✅ Found ${collectionsArray.length} NFT collections`);
             return collectionsArray;
             
         } catch (error) {
-            console.error('NFT fetch error:', error);
+            console.error('NFT error:', error);
             return [];
         }
-    });
+    }, 300); // Cache for 5 minutes
 }
 
-// Format token balance for display
+// Format token balance
 function formatTokenBalance(balance, symbol) {
     const bal = parseFloat(balance);
     if (bal === 0) return '0';
@@ -616,17 +676,22 @@ app.use((req, res) => {
 // Start server
 const server = app.listen(PORT, '0.0.0.0', () => {
     console.log('╔══════════════════════════════════════════╗');
-    console.log('║     🚀 eth.af Backend v4.0              ║');
+    console.log('║     🚀 eth.af Backend v5.0              ║');
+    console.log('║         with DEX Price Fetching         ║');
     console.log('╚══════════════════════════════════════════╝');
     console.log(`📡 Port: ${PORT}`);
     console.log('✨ Features:');
-    console.log('  • Complete token detection');
-    console.log('  • Separate chain balances');
+    console.log('  • ALL token prices via DEX APIs');
+    console.log('  • 1inch + DexScreener integration');
+    console.log('  • Ethereum + Base L2 support');
     console.log('  • NFT floor prices');
     console.log('  • Transaction activity');
     console.log('🔑 APIs:');
     console.log(`  • Etherscan: ${process.env.ETHERSCAN_API_KEY ? '✅' : '❌'}`);
     console.log(`  • Alchemy: ${process.env.ALCHEMY_API_KEY ? '✅' : '❌'}`);
+    console.log('  • 1inch: ✅ (no key needed)');
+    console.log('  • DexScreener: ✅ (no key needed)');
+    console.log('═══════════════════════════════════════════');
 });
 
 // Error handling
