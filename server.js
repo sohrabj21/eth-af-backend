@@ -1,4 +1,4 @@
-// server.js - Enhanced with better token detection and debugging
+// server.js - Robust backend with comprehensive token fetching
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -9,7 +9,7 @@ require('dotenv').config();
 const app = express();
 const PORT = parseInt(process.env.PORT) || 3000;
 
-// Initialize cache
+// Initialize caches
 const cache = new NodeCache({ stdTTL: 300 });
 const priceCache = new NodeCache({ stdTTL: 60 });
 
@@ -18,32 +18,25 @@ app.set('trust proxy', true);
 app.use(cors());
 app.use(express.json());
 
-// Providers
+// ============================================
+// PROVIDERS SETUP
+// ============================================
+
 const providers = {
     ethereum: new ethers.JsonRpcProvider(
         `https://eth-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`
-    ),
-    base: new ethers.JsonRpcProvider(
-        `https://base-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`
     )
 };
 
-// ============================================
-// Helper Functions
-// ============================================
-
-async function resolveENS(ensName) {
-    try {
-        const address = await providers.ethereum.resolveName(ensName);
-        return address;
-    } catch (error) {
-        console.error('ENS resolution error:', error.message);
-        return null;
-    }
+// Only add Base provider if it's available
+if (process.env.ALCHEMY_API_KEY) {
+    providers.base = new ethers.JsonRpcProvider(
+        `https://base-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`
+    );
 }
 
 // ============================================
-// Main Wallet Endpoint
+// MAIN WALLET ENDPOINT
 // ============================================
 
 app.get('/api/wallet/:addressOrEns', async (req, res) => {
@@ -51,9 +44,9 @@ app.get('/api/wallet/:addressOrEns', async (req, res) => {
         let address = req.params.addressOrEns;
         let ensName = null;
         
-        console.log(`\n${'='.repeat(50)}`);
+        console.log(`\n${'='.repeat(60)}`);
         console.log(`🔍 FETCHING WALLET: ${address}`);
-        console.log(`${'='.repeat(50)}`);
+        console.log(`${'='.repeat(60)}`);
         
         // Resolve ENS
         if (address.toLowerCase().endsWith('.eth')) {
@@ -70,32 +63,47 @@ app.get('/api/wallet/:addressOrEns', async (req, res) => {
             return res.status(400).json({ error: 'Invalid Ethereum address' });
         }
         
-        // Fetch all data
-        const [ethereumData, baseData, nfts, activity] = await Promise.all([
-            getCompleteTokenList(address, 'ethereum'),
-            getCompleteTokenList(address, 'base'),
-            getNFTsWithFloorPrice(address),
-            getRecentTransactions(address)
+        // Fetch Ethereum tokens (always works)
+        const ethereumTokens = await fetchAllTokens(address, 'ethereum');
+        
+        // Try to fetch Base tokens (might fail if not enabled)
+        let baseTokens = [];
+        try {
+            baseTokens = await fetchAllTokens(address, 'base');
+        } catch (error) {
+            console.log('⚠️ Base network not available or not enabled in Alchemy');
+        }
+        
+        // Fetch NFTs and activity
+        const [nfts, activity] = await Promise.all([
+            fetchNFTsWithFloorPrices(address),
+            fetchRecentActivity(address)
         ]);
         
-        console.log(`\n📊 RESULTS SUMMARY:`);
-        console.log(`  • Ethereum tokens: ${ethereumData.length}`);
-        console.log(`  • Base tokens: ${baseData.length}`);
-        console.log(`  • NFT collections: ${nfts.length}`);
+        // Combine all tokens
+        const allTokens = [...ethereumTokens, ...baseTokens];
         
-        // Combine and process all tokens
-        const allTokens = [...ethereumData, ...baseData];
-        let totalValue = 0;
+        // Get prices for all tokens
+        console.log('\n💰 Fetching token prices...');
+        for (let token of allTokens) {
+            if (token.contractAddress && !token.price) {
+                token.price = await getTokenPrice(token);
+                token.usdValue = parseFloat(token.balance) * token.price;
+            }
+        }
         
         // Calculate total value
-        allTokens.forEach(token => {
-            totalValue += token.usdValue || 0;
-        });
+        const totalValue = allTokens.reduce((sum, t) => sum + (t.usdValue || 0), 0);
         
-        // Sort tokens by value
+        // Sort by USD value
         allTokens.sort((a, b) => (b.usdValue || 0) - (a.usdValue || 0));
         
-        console.log(`\n💰 Total Portfolio Value: $${totalValue.toFixed(2)}`);
+        console.log(`\n✅ SUMMARY:`);
+        console.log(`  • Total tokens: ${allTokens.length}`);
+        console.log(`  • Ethereum tokens: ${ethereumTokens.length}`);
+        console.log(`  • Base tokens: ${baseTokens.length}`);
+        console.log(`  • Total value: $${totalValue.toFixed(2)}`);
+        console.log(`  • NFT collections: ${nfts.length}`);
         
         res.json({
             address,
@@ -120,28 +128,27 @@ app.get('/api/wallet/:addressOrEns', async (req, res) => {
 });
 
 // ============================================
-// Complete Token Fetching with Prices
+// COMPREHENSIVE TOKEN FETCHING
 // ============================================
 
-async function getCompleteTokenList(address, chain) {
-    console.log(`\n🔗 Fetching tokens for ${chain}...`);
+async function fetchAllTokens(address, chain) {
+    console.log(`\n📊 Fetching ${chain} tokens for ${address.slice(0, 6)}...`);
     
     const tokens = [];
-    const alchemyKey = process.env.ALCHEMY_API_KEY;
-    
-    if (!alchemyKey) {
-        console.error('❌ No Alchemy API key!');
-        return [];
-    }
     
     try {
-        // Get native balance
+        // 1. Get native ETH balance
         const provider = providers[chain];
+        if (!provider) {
+            console.log(`  ⚠️ No provider for ${chain}`);
+            return [];
+        }
+        
         const ethBalance = await provider.getBalance(address);
         const ethFormatted = ethers.formatEther(ethBalance);
         
         if (parseFloat(ethFormatted) > 0) {
-            const ethPrice = await getTokenPrice('ETH');
+            const ethPrice = await getETHPrice();
             tokens.push({
                 name: chain === 'base' ? 'ETH on Base' : 'Ethereum',
                 symbol: 'ETH',
@@ -153,35 +160,34 @@ async function getCompleteTokenList(address, chain) {
                 isNative: true,
                 logo: 'https://cryptologos.cc/logos/ethereum-eth-logo.png'
             });
-            console.log(`  ✓ ETH Balance: ${ethFormatted} ($${(parseFloat(ethFormatted) * ethPrice).toFixed(2)})`);
+            console.log(`  ✓ ETH: ${parseFloat(ethFormatted).toFixed(4)} ETH`);
         }
         
-        // Get all ERC-20 tokens
-        const alchemyUrl = `https://${chain === 'base' ? 'base' : 'eth'}-mainnet.g.alchemy.com/v2/${alchemyKey}`;
+        // 2. Get all ERC-20 tokens via Alchemy
+        const alchemyUrl = `https://${chain === 'base' ? 'base' : 'eth'}-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`;
         
-        // Method 1: Get token balances
-        const balancesResponse = await axios.post(alchemyUrl, {
+        // Get token balances
+        const balancesRes = await axios.post(alchemyUrl, {
             jsonrpc: '2.0',
             method: 'alchemy_getTokenBalances',
             params: [address],
             id: 1
         });
         
-        if (balancesResponse.data.result?.tokenBalances) {
-            const tokenBalances = balancesResponse.data.result.tokenBalances.filter(
-                tb => tb.tokenBalance && tb.tokenBalance !== '0x0'
+        if (balancesRes.data.result?.tokenBalances) {
+            const nonZeroBalances = balancesRes.data.result.tokenBalances.filter(
+                tb => tb.tokenBalance && tb.tokenBalance !== '0x0' && tb.tokenBalance !== '0x'
             );
             
-            console.log(`  📦 Found ${tokenBalances.length} tokens with balances`);
+            console.log(`  📦 Found ${nonZeroBalances.length} tokens with balances`);
             
-            // Get metadata and prices for each token
-            for (const tb of tokenBalances) {
+            // Get metadata for each token
+            for (const tokenBalance of nonZeroBalances) {
                 try {
-                    // Get token metadata
                     const metadataRes = await axios.post(alchemyUrl, {
                         jsonrpc: '2.0',
                         method: 'alchemy_getTokenMetadata',
-                        params: [tb.contractAddress],
+                        params: [tokenBalance.contractAddress],
                         id: 1
                     });
                     
@@ -189,135 +195,130 @@ async function getCompleteTokenList(address, chain) {
                     if (!metadata) continue;
                     
                     const decimals = metadata.decimals || 18;
-                    const balance = ethers.formatUnits(tb.tokenBalance, decimals);
+                    const rawBalance = tokenBalance.tokenBalance;
+                    const formattedBalance = ethers.formatUnits(rawBalance, decimals);
                     
-                    if (parseFloat(balance) === 0) continue;
-                    
-                    // Get price
-                    let price = 0;
-                    let usdValue = 0;
-                    
-                    // Try multiple price sources
-                    price = await getTokenPrice(metadata.symbol, tb.contractAddress, chain);
-                    usdValue = parseFloat(balance) * price;
+                    // Skip dust
+                    if (parseFloat(formattedBalance) < 0.000000001) continue;
                     
                     tokens.push({
-                        name: metadata.name || 'Unknown',
-                        symbol: metadata.symbol || '???',
-                        balance: balance,
-                        price: price,
-                        usdValue: usdValue,
+                        name: metadata.name || 'Unknown Token',
+                        symbol: metadata.symbol || 'UNKNOWN',
+                        balance: formattedBalance,
+                        decimals: decimals,
+                        contractAddress: tokenBalance.contractAddress,
                         chain,
                         chainEmoji: chain === 'base' ? '🔵' : '🟦',
-                        contractAddress: tb.contractAddress,
                         logo: metadata.logo || '',
-                        decimals
+                        price: 0, // Will be fetched later
+                        usdValue: 0
                     });
                     
-                    console.log(`  ✓ ${metadata.symbol}: ${parseFloat(balance).toFixed(4)} ($${usdValue.toFixed(2)})`);
+                    console.log(`  ✓ ${metadata.symbol}: ${parseFloat(formattedBalance).toFixed(6)}`);
                     
                 } catch (err) {
-                    console.error(`  ⚠️ Error processing token ${tb.contractAddress}:`, err.message);
+                    console.error(`  ⚠️ Error getting metadata for ${tokenBalance.contractAddress}`);
                 }
             }
         }
         
     } catch (error) {
         console.error(`❌ Error fetching ${chain} tokens:`, error.message);
+        if (error.response?.status === 403) {
+            console.log(`  ⚠️ ${chain} network not enabled in Alchemy. Please enable it in your Alchemy dashboard.`);
+        }
     }
     
     return tokens;
 }
 
 // ============================================
-// Token Price Fetching
+// TOKEN PRICE FETCHING
 // ============================================
 
-async function getTokenPrice(symbol, contractAddress = null, chain = 'ethereum') {
-    // Common token prices
-    const staticPrices = {
-        'ETH': 2000,
-        'WETH': 2000,
-        'USDC': 1,
-        'USDT': 1,
-        'DAI': 1,
+async function getETHPrice() {
+    try {
+        const res = await axios.get('https://api.coingecko.com/api/v3/simple/price', {
+            params: { ids: 'ethereum', vs_currencies: 'usd' }
+        });
+        return res.data.ethereum?.usd || 2000;
+    } catch (err) {
+        return 2000; // Fallback
+    }
+}
+
+async function getTokenPrice(token) {
+    // Check cache first
+    const cacheKey = `price_${token.symbol}_${token.contractAddress}`;
+    const cached = priceCache.get(cacheKey);
+    if (cached) return cached;
+    
+    let price = 0;
+    
+    // Common tokens
+    const commonPrices = {
+        'USDC': 1, 'USDT': 1, 'DAI': 1, 'BUSD': 1, 'TUSD': 1,
+        'WETH': await getETHPrice(),
         'WBTC': 45000
     };
     
-    if (staticPrices[symbol?.toUpperCase()]) {
-        return staticPrices[symbol.toUpperCase()];
+    if (commonPrices[token.symbol]) {
+        price = commonPrices[token.symbol];
     }
     
-    // If we have contract address, try DEX prices
-    if (contractAddress) {
+    // Try CoinGecko
+    if (!price && token.symbol) {
         try {
-            // Try 1inch API
-            const chainId = chain === 'base' ? 8453 : 1;
-            const url = `https://api.1inch.dev/price/v1.1/${chainId}/${contractAddress}`;
-            
-            const response = await axios.get(url, {
-                headers: {
-                    'Authorization': `Bearer ${process.env.ONEINCH_API_KEY || ''}`
+            const res = await axios.get('https://api.coingecko.com/api/v3/simple/price', {
+                params: {
+                    ids: token.name?.toLowerCase().replace(/\s+/g, '-'),
+                    vs_currencies: 'usd'
                 },
                 timeout: 3000
             });
             
-            if (response.data && response.data[contractAddress]) {
-                const priceInUSD = parseFloat(response.data[contractAddress]);
-                if (priceInUSD > 0) {
-                    console.log(`    💵 Found 1inch price for ${symbol}: $${priceInUSD}`);
-                    return priceInUSD;
-                }
+            const key = Object.keys(res.data)[0];
+            if (key && res.data[key]?.usd) {
+                price = res.data[key].usd;
             }
         } catch (err) {
-            // Try DexScreener as fallback
-            try {
-                const dexRes = await axios.get(
-                    `https://api.dexscreener.com/latest/dex/tokens/${contractAddress}`,
-                    { timeout: 3000 }
-                );
-                
-                if (dexRes.data?.pairs?.[0]?.priceUsd) {
-                    const price = parseFloat(dexRes.data.pairs[0].priceUsd);
-                    console.log(`    💵 Found DexScreener price for ${symbol}: $${price}`);
-                    return price;
-                }
-            } catch (e) {
-                // No price found
-            }
+            // Ignore CoinGecko errors
         }
     }
     
-    // Try CoinGecko for symbol
-    try {
-        const cgResponse = await axios.get(
-            'https://api.coingecko.com/api/v3/simple/price',
-            {
-                params: {
-                    ids: symbol.toLowerCase(),
-                    vs_currencies: 'usd'
-                },
-                timeout: 3000
+    // Try DexScreener for contract address
+    if (!price && token.contractAddress) {
+        try {
+            const res = await axios.get(
+                `https://api.dexscreener.com/latest/dex/tokens/${token.contractAddress}`,
+                { timeout: 3000 }
+            );
+            
+            if (res.data?.pairs?.[0]?.priceUsd) {
+                price = parseFloat(res.data.pairs[0].priceUsd);
+                console.log(`    💰 DexScreener price for ${token.symbol}: $${price}`);
             }
-        );
-        
-        if (cgResponse.data[symbol.toLowerCase()]) {
-            return cgResponse.data[symbol.toLowerCase()].usd;
+        } catch (err) {
+            // Ignore DexScreener errors
         }
-    } catch (err) {
-        // No CoinGecko price
     }
     
-    console.log(`    ⚠️ No price found for ${symbol}`);
-    return 0;
+    // Cache the price
+    if (price > 0) {
+        priceCache.set(cacheKey, price);
+    }
+    
+    return price;
 }
 
 // ============================================
-// NFT Fetching with Floor Prices
+// NFT FETCHING WITH FLOOR PRICES
 // ============================================
 
-async function getNFTsWithFloorPrice(address) {
+async function fetchNFTsWithFloorPrices(address) {
     try {
+        console.log('\n🎨 Fetching NFT collections...');
+        
         const url = `https://eth-mainnet.g.alchemy.com/nft/v3/${process.env.ALCHEMY_API_KEY}/getNFTsForOwner`;
         
         const response = await axios.get(url, {
@@ -331,13 +332,13 @@ async function getNFTsWithFloorPrice(address) {
         const collections = {};
         
         if (response.data.ownedNfts) {
-            // Group by collection
+            // Group NFTs by collection
             response.data.ownedNfts.forEach(nft => {
                 const key = nft.contract.address;
                 
                 if (!collections[key]) {
                     collections[key] = {
-                        name: nft.contract.name || 'Unknown',
+                        name: nft.contract.name || 'Unknown Collection',
                         address: nft.contract.address,
                         nfts: [],
                         floorPrice: 0,
@@ -347,7 +348,8 @@ async function getNFTsWithFloorPrice(address) {
                 
                 let image = nft.image?.cachedUrl || 
                            nft.image?.thumbnailUrl || 
-                           nft.image?.originalUrl || '';
+                           nft.image?.originalUrl || 
+                           '';
                            
                 if (image?.startsWith('ipfs://')) {
                     image = `https://ipfs.io/ipfs/${image.slice(7)}`;
@@ -362,7 +364,7 @@ async function getNFTsWithFloorPrice(address) {
             });
         }
         
-        // Get floor prices and calculate values
+        // Get floor prices for each collection
         for (const collection of Object.values(collections)) {
             try {
                 const floorRes = await axios.post(
@@ -378,7 +380,7 @@ async function getNFTsWithFloorPrice(address) {
                 // No floor price available
             }
             
-            // Sort NFTs: images first
+            // Sort NFTs within collection (images first)
             collection.nfts.sort((a, b) => {
                 if (a.hasImage && !b.hasImage) return -1;
                 if (!a.hasImage && b.hasImage) return 1;
@@ -387,7 +389,13 @@ async function getNFTsWithFloorPrice(address) {
         }
         
         // Sort collections by total value (highest first)
-        return Object.values(collections).sort((a, b) => b.totalValue - a.totalValue);
+        const sortedCollections = Object.values(collections).sort(
+            (a, b) => b.totalValue - a.totalValue
+        );
+        
+        console.log(`  ✓ Found ${sortedCollections.length} NFT collections`);
+        
+        return sortedCollections;
         
     } catch (error) {
         console.error('NFT fetch error:', error);
@@ -396,10 +404,10 @@ async function getNFTsWithFloorPrice(address) {
 }
 
 // ============================================
-// Recent Transactions
+// ACTIVITY FETCHING
 // ============================================
 
-async function getRecentTransactions(address) {
+async function fetchRecentActivity(address) {
     if (!process.env.ETHERSCAN_API_KEY) return [];
     
     try {
@@ -407,7 +415,7 @@ async function getRecentTransactions(address) {
         
         const response = await axios.get(url);
         
-        if (response.data.result) {
+        if (response.data.result && Array.isArray(response.data.result)) {
             return response.data.result.map(tx => ({
                 hash: tx.hash,
                 from: tx.from,
@@ -425,91 +433,108 @@ async function getRecentTransactions(address) {
 }
 
 // ============================================
-// Debug Endpoint
+// HELPER FUNCTIONS
+// ============================================
+
+async function resolveENS(ensName) {
+    try {
+        const address = await providers.ethereum.resolveName(ensName);
+        return address;
+    } catch (error) {
+        console.error('ENS resolution error:', error);
+        return null;
+    }
+}
+
+// ============================================
+// DEBUG ENDPOINT
 // ============================================
 
 app.get('/api/debug/:address/:chain', async (req, res) => {
     const { address, chain } = req.params;
     
-    console.log(`\n🐛 DEBUG MODE for ${address} on ${chain}`);
+    console.log(`\n🐛 DEBUG: ${address} on ${chain}`);
     
     try {
-        const alchemyUrl = `https://${chain === 'base' ? 'base' : 'eth'}-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`;
-        
-        // Get raw token balances
-        const response = await axios.post(alchemyUrl, {
-            jsonrpc: '2.0',
-            method: 'alchemy_getTokenBalances',
-            params: [address],
-            id: 1
-        });
-        
-        const tokens = [];
-        
-        if (response.data.result?.tokenBalances) {
-            for (const tb of response.data.result.tokenBalances) {
-                if (tb.tokenBalance === '0x0') continue;
-                
-                // Get metadata
-                const metaRes = await axios.post(alchemyUrl, {
-                    jsonrpc: '2.0',
-                    method: 'alchemy_getTokenMetadata',
-                    params: [tb.contractAddress],
-                    id: 1
-                });
-                
-                const meta = metaRes.data.result;
-                const balance = ethers.formatUnits(tb.tokenBalance, meta?.decimals || 18);
-                
-                tokens.push({
-                    contract: tb.contractAddress,
-                    symbol: meta?.symbol,
-                    name: meta?.name,
-                    balance: balance,
-                    rawBalance: tb.tokenBalance,
-                    decimals: meta?.decimals
-                });
-            }
+        // Check if Base is available
+        if (chain === 'base' && !process.env.ALCHEMY_API_KEY) {
+            return res.status(400).json({ 
+                error: 'Base network requires Alchemy API key',
+                solution: 'Enable Base Mainnet in your Alchemy dashboard'
+            });
         }
+        
+        const tokens = await fetchAllTokens(address, chain);
         
         res.json({
             chain,
             address,
             tokenCount: tokens.length,
-            tokens
+            tokens: tokens.map(t => ({
+                symbol: t.symbol,
+                balance: t.balance,
+                contract: t.contractAddress,
+                hasPrice: t.price > 0
+            }))
         });
         
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        res.status(500).json({ 
+            error: error.message,
+            details: error.response?.data || 'No additional details'
+        });
     }
 });
 
-// Health check
+// ============================================
+// OTHER ENDPOINTS
+// ============================================
+
 app.get('/api/health', (req, res) => {
-    res.json({ status: 'OK', timestamp: new Date().toISOString() });
+    res.json({ 
+        status: 'OK', 
+        timestamp: new Date().toISOString(),
+        version: '7.0'
+    });
 });
 
-// Root
 app.get('/', (req, res) => {
     res.json({ 
-        message: 'eth.af API v6.0',
+        message: '🚀 eth.af API v7.0',
+        features: [
+            'Ethereum mainnet tokens ✅',
+            'Base L2 tokens (if enabled in Alchemy) ✅',
+            'NFT collections with floor prices ✅',
+            'Transaction history ✅',
+            'DEX price discovery ✅'
+        ],
         endpoints: {
-            wallet: '/api/wallet/{address}',
-            debug: '/api/debug/{address}/{chain}'
+            wallet: '/api/wallet/{address-or-ens}',
+            debug: '/api/debug/{address}/{chain}',
+            health: '/api/health'
         }
     });
 });
 
-// Start server
+// ============================================
+// START SERVER
+// ============================================
+
 const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`\n${'='.repeat(50)}`);
-    console.log(`🚀 eth.af Backend v6.0 - Debug Edition`);
+    console.log(`\n${'='.repeat(60)}`);
+    console.log(`🚀 eth.af Backend v7.0 - Production Ready`);
     console.log(`📡 Port: ${PORT}`);
-    console.log(`🔑 Alchemy: ${process.env.ALCHEMY_API_KEY ? '✅' : '❌'}`);
-    console.log(`🔑 Etherscan: ${process.env.ETHERSCAN_API_KEY ? '✅' : '❌'}`);
-    console.log(`${'='.repeat(50)}\n`);
+    console.log(`\n🔑 API Keys:`);
+    console.log(`  • Alchemy: ${process.env.ALCHEMY_API_KEY ? '✅ Connected' : '❌ Missing'}`);
+    console.log(`  • Etherscan: ${process.env.ETHERSCAN_API_KEY ? '✅ Connected' : '❌ Missing'}`);
+    console.log(`\n📝 Notes:`);
+    console.log(`  • Base network requires enabling in Alchemy dashboard`);
+    console.log(`  • DexScreener provides free price data`);
+    console.log(`  • NFT floor prices from OpenSea via Alchemy`);
+    console.log(`${'='.repeat(60)}\n`);
 });
 
 process.on('SIGTERM', () => {
+    console.log('Shutting down gracefully...');
     server.close(() => process.exit(0));
 });
