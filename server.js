@@ -240,23 +240,45 @@ app.get('/', (req, res) => {
     });
 });
 
-// Start server - IMPORTANT: Bind to 0.0.0.0 for Railway
+// Root route for Railway health check
+app.get('/', (req, res) => {
+    res.json({ 
+        message: 'eth.af API is running!',
+        endpoints: {
+            health: '/api/health',
+            wallet: '/api/wallet/{address-or-ens}'
+        }
+    });
+});
+
+// Start server - CRITICAL: Bind to 0.0.0.0 for Railway
 const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`eth.af backend server running on port ${PORT}`);
+    console.log(`eth.af backend server running on http://0.0.0.0:${PORT}`);
     console.log('Environment check:');
     console.log('- Etherscan API:', process.env.ETHERSCAN_API_KEY ? '✓' : '✗');
     console.log('- Alchemy API:', process.env.ALCHEMY_API_KEY ? '✓' : '✗');
+    console.log('- RPC URL:', process.env.ETHEREUM_RPC_URL?.includes('demo') ? '⚠️ Using demo (will fail!)' : '✓');
     console.log('Server is ready to handle requests!');
 });
 
-// Keep the server alive
-server.keepAliveTimeout = 120000; // 2 minutes
-server.headersTimeout = 120000; // 2 minutes
+// Keep server alive
+server.keepAliveTimeout = 120000;
+server.headersTimeout = 120000;
 
-// Handle shutdown
+// Handle shutdown gracefully
 process.on('SIGTERM', () => {
-    console.log('Server shutting down...');
+    console.log('Received SIGTERM, shutting down gracefully...');
     server.close(() => {
+        console.log('Server closed');
         process.exit(0);
     });
+});
+
+// Prevent crash on errors
+process.on('uncaughtException', (err) => {
+    console.error('Uncaught Exception:', err);
+});
+
+process.on('unhandledRejection', (err) => {
+    console.error('Unhandled Rejection:', err);
 });
