@@ -17,6 +17,9 @@ const cache = new NodeCache({ stdTTL: 300 });
 app.use(cors());
 app.use(express.json());
 
+// Trust proxy for Railway deployment
+app.set('trust proxy', 1);
+
 // Rate limiting
 const limiter = rateLimit({
     windowMs: 1 * 60 * 1000, // 1 minute
