@@ -7,7 +7,7 @@ const { ethers } = require('ethers');
 require('dotenv').config();
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 3000;
 
 // Initialize cache (TTL: 5 minutes)
 const cache = new NodeCache({ stdTTL: 300 });
