@@ -229,8 +229,19 @@ async function getTokenPrices() {
     });
 }
 
-// Start server
-app.listen(PORT, () => {
+// Root route for Railway
+app.get('/', (req, res) => {
+    res.json({ 
+        message: 'eth.af API is running!',
+        endpoints: {
+            health: '/api/health',
+            wallet: '/api/wallet/{address-or-ens}'
+        }
+    });
+});
+
+// Start server - IMPORTANT: Bind to 0.0.0.0 for Railway
+const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`eth.af backend server running on port ${PORT}`);
     console.log('Environment check:');
     console.log('- Etherscan API:', process.env.ETHERSCAN_API_KEY ? '✓' : '✗');
@@ -238,8 +249,14 @@ app.listen(PORT, () => {
     console.log('Server is ready to handle requests!');
 });
 
+// Keep the server alive
+server.keepAliveTimeout = 120000; // 2 minutes
+server.headersTimeout = 120000; // 2 minutes
+
 // Handle shutdown
 process.on('SIGTERM', () => {
     console.log('Server shutting down...');
-    process.exit(0);
+    server.close(() => {
+        process.exit(0);
+    });
 });
