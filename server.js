@@ -449,7 +449,7 @@ async function fetchChainTokensFast(address, chainId) {
 }
 
 // ============================================
-// ULTRA-FAST NFT FETCHING
+// ULTRA-FAST NFT FETCHING WITH FLOOR PRICES
 // ============================================
 
 async function fetchNFTsFast(address) {
@@ -460,18 +460,24 @@ async function fetchNFTsFast(address) {
             params: {
                 owner: address,
                 withMetadata: true,
-                pageSize: 100,
-                excludeFilters: ['SPAM'] // Exclude spam NFTs
+                pageSize: 200,
+                orderBy: 'transferTime'
             },
-            timeout: 3000
+            timeout: 5000
         });
         
         const collections = {};
         
         if (response.data.ownedNfts) {
+            // Process NFTs into collections
             response.data.ownedNfts.forEach(nft => {
-                // Skip if it's spam
-                if (nft.spamInfo?.isSpam) return;
+                // Skip obvious spam patterns
+                if (nft.contract.name && (
+                    nft.contract.name.includes('.com') ||
+                    nft.contract.name.includes('Visit ') ||
+                    nft.contract.name.includes('Free ') ||
+                    nft.contract.name.includes('Claim ')
+                )) return;
                 
                 const key = nft.contract.address;
                 
@@ -479,29 +485,98 @@ async function fetchNFTsFast(address) {
                     collections[key] = {
                         name: nft.contract.name || 'Unknown',
                         address: key,
+                        symbol: nft.contract.symbol,
                         nfts: [],
                         floorPrice: 0,
-                        totalValue: 0
+                        totalValue: 0,
+                        openSeaSlug: nft.contract.openSeaMetadata?.collectionSlug || null
                     };
                 }
                 
                 let image = nft.image?.thumbnailUrl || 
                            nft.image?.cachedUrl || 
+                           nft.raw?.metadata?.image ||
                            '';
                 
+                // Convert IPFS URLs to HTTP gateway
+                if (image && image.startsWith('ipfs://')) {
+                    image = `https://ipfs.io/ipfs/${image.slice(7)}`;
+                }
+                
                 collections[key].nfts.push({
-                    name: nft.name || `#${nft.tokenId}`,
+                    name: nft.name || nft.title || `#${nft.tokenId}`,
                     tokenId: nft.tokenId,
                     image,
                     largeImage: nft.image?.cachedUrl || image,
-                    hasImage: !!image
+                    hasImage: !!image,
+                    description: nft.description
                 });
             });
         }
         
-        return Object.values(collections);
+        // Get floor prices for collections (parallel)
+        const collectionArray = Object.values(collections);
+        const floorPricePromises = collectionArray.map(async (collection) => {
+            try {
+                // Try to get floor price from Alchemy
+                const floorUrl = `https://eth-mainnet.g.alchemy.com/nft/v3/${process.env.ALCHEMY_API_KEY}/getFloorPrice`;
+                const floorResponse = await axios.get(floorUrl, {
+                    params: {
+                        contractAddress: collection.address
+                    },
+                    timeout: 2000
+                });
+                
+                if (floorResponse.data?.openSea?.floorPrice) {
+                    collection.floorPrice = floorResponse.data.openSea.floorPrice;
+                    collection.totalValue = collection.floorPrice * collection.nfts.length;
+                    collection.marketplace = 'OpenSea';
+                } else if (floorResponse.data?.looksRare?.floorPrice) {
+                    collection.floorPrice = floorResponse.data.looksRare.floorPrice;
+                    collection.totalValue = collection.floorPrice * collection.nfts.length;
+                    collection.marketplace = 'LooksRare';
+                }
+            } catch (error) {
+                // Silently fail for individual floor price fetches
+            }
+        });
+        
+        // Wait for all floor prices (with timeout)
+        await Promise.race([
+            Promise.all(floorPricePromises),
+            new Promise(resolve => setTimeout(resolve, 3000))
+        ]);
+        
+        // Filter out collections with no floor price (likely spam)
+        // BUT keep collections with many NFTs even without floor price
+        const validCollections = collectionArray.filter(collection => {
+            // Keep if has floor price
+            if (collection.floorPrice > 0) return true;
+            // Keep if has 5+ NFTs (likely legitimate collection)
+            if (collection.nfts.length >= 5) return true;
+            // Keep if it's a known legitimate collection name pattern
+            if (collection.name && (
+                collection.name.includes('ENS') ||
+                collection.name.includes('Lens') ||
+                collection.name.includes('POAP') ||
+                collection.name.includes('Uniswap') ||
+                collection.name.includes('CryptoPunks') ||
+                collection.name.includes('Bored Ape') ||
+                collection.name.includes('Azuki') ||
+                collection.name.includes('Doodles') ||
+                collection.name.includes('Moonbirds')
+            )) return true;
+            // Otherwise, only keep if has at least 1 NFT with an image
+            return collection.nfts.some(nft => nft.hasImage);
+        });
+        
+        // Sort by total value (collections with floor prices first)
+        validCollections.sort((a, b) => (b.totalValue || 0) - (a.totalValue || 0));
+        
+        return validCollections;
         
     } catch (error) {
+        console.error('NFT fetch error:', error);
         return [];
     }
 }
