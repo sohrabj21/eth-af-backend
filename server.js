@@ -83,18 +83,17 @@ const SPAM_TOKEN_PATTERNS = [
     /^Visit.*\.com$/i,
     /^www\./i,
     /^https?:\/\//i,
-    /\$.*free/i,
-    /zepe\.io/i,
-    /^ERC20-/i,
-    /^$ /,
-    /^#/
+    /zepe\.io/i
 ];
 
 const LEGITIMATE_TOKENS = [
     'ETH', 'WETH', 'USDC', 'USDT', 'DAI', 'WBTC', 'LINK', 'UNI', 'AAVE',
     'MKR', 'SNX', 'CRV', 'SUSHI', 'YFI', 'COMP', 'BAL', 'MATIC', 'BNB',
     'AVAX', 'FTM', 'OP', 'ARB', 'PEPE', 'SHIB', 'DOGE', 'APE', 'SAND',
-    'MANA', 'AXS', 'GALA', 'ENJ', 'CHZ', 'BLUR', 'LDO', 'RPL', 'FXS'
+    'MANA', 'AXS', 'GALA', 'ENJ', 'CHZ', 'BLUR', 'LDO', 'RPL', 'FXS',
+    'FRAX', 'GRT', 'ENS', 'BAT', 'ZRX', '1INCH', 'BUSD', 'TUSD', 'USDP',
+    'RAI', 'LUSD', 'MIM', 'CVX', 'CRO', 'QNT', 'RNDR', 'IMX', 'LRC',
+    'OCEAN', 'AGIX', 'FET', 'GNO', 'RDNT', 'GMX', 'GNS', 'PENDLE'
 ];
 
 function isLikelySpamToken(token) {
@@ -103,23 +102,26 @@ function isLikelySpamToken(token) {
         return false;
     }
     
-    // Never filter tokens with significant value
-    if (token.usdValue > 5) {
+    // Never filter tokens with ANY value
+    if (token.usdValue > 0.01) {
         return false;
     }
     
-    // Check for obvious spam patterns
-    for (const pattern of SPAM_TOKEN_PATTERNS) {
-        if (token.name && pattern.test(token.name)) {
-            return true;
-        }
-        if (token.symbol && pattern.test(token.symbol)) {
-            return true;
-        }
+    // Only check for the most obvious spam patterns
+    const tokenName = (token.name || '').toLowerCase();
+    const tokenSymbol = (token.symbol || '').toLowerCase();
+    
+    // Only filter if it EXACTLY matches known spam patterns
+    if (tokenName.startsWith('visit ') && tokenName.includes('.com')) {
+        return true;
     }
     
-    // Filter if name is just an address
-    if (token.name && /^0x[a-fA-F0-9]{40}$/.test(token.name)) {
+    if (tokenName.startsWith('www.') || tokenName.startsWith('http://') || tokenName.startsWith('https://')) {
+        return true;
+    }
+    
+    // Check if name is just a raw Ethereum address
+    if (/^0x[a-fA-F0-9]{40}$/.test(token.name) && token.usdValue === 0) {
         return true;
     }
     
@@ -388,7 +390,7 @@ async function fetchTokensSafe(address, chain) {
                 
                 console.log(`    📦 Found ${nonZeroBalances.length} tokens`);
                 
-                // Process tokens in batches to avoid timeouts
+                // Process ALL tokens - no limits
                 const batchSize = 10;
                 for (let i = 0; i < nonZeroBalances.length; i += batchSize) {
                     const batch = nonZeroBalances.slice(i, i + batchSize);
@@ -432,6 +434,8 @@ async function fetchTokensSafe(address, chain) {
                     const batchResults = await Promise.all(batchPromises);
                     tokens.push(...batchResults.filter(t => t !== null));
                 }
+                
+                console.log(`    ✅ Fetched ${tokens.length} tokens from ${chain}`);
             }
         } catch (error) {
             console.log(`    ⚠️ Failed to get ${chain} ERC-20 tokens:`, error.message);
@@ -459,21 +463,21 @@ async function fetchNFTsSafe(address) {
             params: {
                 owner: address,
                 withMetadata: true,
-                pageSize: 100
+                pageSize: 500  // Increased to get ALL NFTs
             },
-            timeout: 10000
+            timeout: 15000  // Increased timeout for more NFTs
         });
         
         const collections = {};
         
         if (response.data.ownedNfts) {
+            console.log(`    📦 Found ${response.data.ownedNfts.length} total NFTs`);
+            
             response.data.ownedNfts.forEach(nft => {
-                // Skip obvious spam NFTs
-                if (nft.contract.name && (
-                    nft.contract.name.toLowerCase().includes('.com') ||
-                    nft.contract.name.toLowerCase().includes('visit ') ||
-                    nft.contract.name.toLowerCase().includes('claim')
-                )) {
+                // VERY minimal spam filter - only filter the most egregious spam
+                const contractName = (nft.contract.name || '').toLowerCase();
+                if (contractName.includes('visit ') && contractName.includes('.com')) {
+                    // Only skip if it has BOTH "visit " AND ".com" in the name
                     return;
                 }
                 
@@ -481,7 +485,7 @@ async function fetchNFTsSafe(address) {
                 
                 if (!collections[key]) {
                     collections[key] = {
-                        name: nft.contract.name || 'Unknown',
+                        name: nft.contract.name || 'Unknown Collection',
                         address: key,
                         nfts: [],
                         floorPrice: 0,
@@ -489,21 +493,36 @@ async function fetchNFTsSafe(address) {
                     };
                 }
                 
+                // Try multiple image sources
                 let image = nft.image?.thumbnailUrl || 
-                           nft.image?.cachedUrl || 
+                           nft.image?.cachedUrl ||
+                           nft.image?.originalUrl ||
+                           nft.image?.pngUrl ||
+                           nft.image?.jpegUrl ||
+                           nft.media?.[0]?.thumbnail ||
+                           nft.media?.[0]?.gateway ||
+                           nft.metadata?.image ||
+                           nft.metadata?.image_url ||
                            '';
                 
+                // Convert IPFS URLs to HTTP gateway
+                if (image && image.startsWith('ipfs://')) {
+                    image = `https://ipfs.io/ipfs/${image.slice(7)}`;
+                }
+                
                 collections[key].nfts.push({
-                    name: nft.name || `#${nft.tokenId}`,
+                    name: nft.name || nft.title || `#${nft.tokenId}`,
                     tokenId: nft.tokenId,
                     image,
-                    largeImage: nft.image?.cachedUrl || image,
+                    largeImage: nft.image?.originalUrl || nft.image?.cachedUrl || image,
                     hasImage: !!image
                 });
             });
+            
+            console.log(`    📚 Organized into ${Object.keys(collections).length} collections`);
         }
         
-        // Sort NFTs and collections
+        // Sort NFTs within each collection
         Object.values(collections).forEach(c => {
             c.nfts.sort((a, b) => {
                 if (a.hasImage && !b.hasImage) return -1;
@@ -512,9 +531,11 @@ async function fetchNFTsSafe(address) {
             });
         });
         
-        // Try to get floor prices (optional enhancement)
+        // Try to get floor prices (optional enhancement - don't block NFT display)
         const collectionArray = Object.values(collections);
-        for (const collection of collectionArray) {
+        
+        // Get floor prices in parallel but with timeout
+        const floorPricePromises = collectionArray.slice(0, 20).map(async (collection) => {
             try {
                 const floorUrl = `https://eth-mainnet.g.alchemy.com/nft/v3/${process.env.ALCHEMY_API_KEY}/getFloorPrice`;
                 const floorResponse = await axios.get(floorUrl, {
@@ -530,13 +551,25 @@ async function fetchNFTsSafe(address) {
                     collection.marketplace = 'OpenSea';
                 }
             } catch (error) {
-                // Silently fail for floor prices
+                // Silently fail for floor prices - don't block NFT display
             }
-        }
+        });
         
-        // Sort by total value
-        collectionArray.sort((a, b) => (b.totalValue || 0) - (a.totalValue || 0));
+        // Wait for floor prices but don't let it block too long
+        await Promise.race([
+            Promise.all(floorPricePromises),
+            new Promise(resolve => setTimeout(resolve, 3000))
+        ]);
         
+        // Sort by total value, then by number of NFTs
+        collectionArray.sort((a, b) => {
+            if (a.totalValue && !b.totalValue) return -1;
+            if (!a.totalValue && b.totalValue) return 1;
+            if (a.totalValue && b.totalValue) return b.totalValue - a.totalValue;
+            return b.nfts.length - a.nfts.length;
+        });
+        
+        console.log(`    ✅ Returning ${collectionArray.length} NFT collections`);
         return collectionArray;
         
     } catch (error) {
