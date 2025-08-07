@@ -104,13 +104,11 @@ const CHAINS = {
 const providers = {};
 Object.entries(CHAINS).forEach(([chainId, config]) => {
     try {
-        providers[chainId] = new ethers.JsonRpcProvider(
-            `https://${config.rpc}.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`,
-            undefined,
-            { timeout: 3000 } // 3 second timeout
-        );
+        const rpcUrl = `https://${config.rpc}.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`;
+        providers[chainId] = new ethers.JsonRpcProvider(rpcUrl);
+        console.log(`✅ Initialized ${config.name} provider`);
     } catch (error) {
-        console.log(`⚠️ Failed to initialize ${config.name} provider`);
+        console.log(`⚠️ Failed to initialize ${config.name} provider:`, error.message);
     }
 });
 
@@ -124,55 +122,99 @@ const SPAM_PATTERNS = {
         /^Visit.*\.com$/i,
         /^www\..*$/i,
         /^https?:\/\//i,
-        /\$\d+\.?free/i,
-        /claim.*bonus/i,
-        /airdrop/i,
-        /^fake/i,
-        /^test/i,
+        /\$\d+.*free/i,
+        /claim.*airdrop/i,
+        /^fake.*token$/i,
         /zepe\.io/i,
-        /\.(com|io|org|net|xyz|tk)$/i,
-        /^ERC-20$/i,
-        /^Token$/i
+        /^ERC20-/i,
+        /^ERC721-/i,
+        /^Voucher/i,
+        /^$ /,  // Tokens starting with $
+        /^#/,   // Tokens starting with #
+        /realtoken/i,
+        /^visit:/i,
+        /^see:/i,
+        /^go to:/i
     ],
     nfts: [
         /^ENS: /i,
-        /^Lens Protocol/i,
-        /^OpenSea Shared/i,
-        /claim/i,
-        /free mint/i,
-        /test/i,
-        /sample/i
+        /^Lens Protocol Profiles/i,
+        /^.com$/i,
+        /visit.*claim/i,
+        /free mint/i
     ]
 };
 
+// Known legitimate tokens (whitelist)
+const LEGITIMATE_TOKENS = [
+    'ETH', 'WETH', 'USDC', 'USDT', 'DAI', 'WBTC', 'LINK', 'UNI', 'AAVE',
+    'MKR', 'SNX', 'CRV', 'SUSHI', 'YFI', 'COMP', 'BAL', 'MATIC', 'BNB',
+    'AVAX', 'FTM', 'OP', 'ARB', 'PEPE', 'SHIB', 'DOGE', 'APE', 'SAND',
+    'MANA', 'AXS', 'GALA', 'ENJ', 'CHZ', 'BLUR', 'LDO', 'RPL', 'FXS',
+    'FRAX', 'GRT', 'ENS', 'BAT', 'ZRX', '1INCH', 'BUSD', 'TUSD', 'USDP',
+    'RAI', 'LUSD', 'MIM', 'CVX', 'FXS', 'CRO', 'QNT', 'RNDR', 'IMX'
+];
+
 function isSpamToken(token) {
-    // Check name and symbol for spam patterns
-    const checkString = `${token.name} ${token.symbol}`.toLowerCase();
+    // Whitelist check - if it's a known legitimate token, it's not spam
+    if (LEGITIMATE_TOKENS.includes(token.symbol?.toUpperCase())) {
+        return false;
+    }
     
-    // Check against patterns
+    // If it has significant value, probably not spam
+    if (token.usdValue > 10) {
+        return false;
+    }
+    
+    // Check name and symbol for spam patterns
     for (const pattern of SPAM_PATTERNS.tokens) {
         if (pattern.test(token.name) || pattern.test(token.symbol)) {
+            console.log(`  ⚠️ Filtered spam token: ${token.name} (${token.symbol})`);
             return true;
         }
     }
     
     // Check for suspicious characteristics
-    if (token.name.length > 50) return true;
-    if (token.symbol.length > 20) return true;
-    if (token.name === token.symbol && token.name.length === 40) return true; // Likely address as name
+    if (token.name && token.name.includes('...')) return true;
+    if (token.name && token.name.length > 50) return true;
+    if (token.symbol && token.symbol.length > 20) return true;
     
-    // If has no value and suspicious name
-    if (token.usdValue === 0 && checkString.includes('visit')) return true;
+    // If name is just an address
+    if (token.name && /^0x[a-fA-F0-9]{40}$/.test(token.name)) return true;
+    
+    // If has zero value AND suspicious name patterns
+    if (token.usdValue === 0) {
+        const lowerName = (token.name || '').toLowerCase();
+        const lowerSymbol = (token.symbol || '').toLowerCase();
+        
+        if (lowerName.includes('visit') || lowerName.includes('claim') || 
+            lowerName.includes('.com') || lowerName.includes('http')) {
+            return true;
+        }
+        
+        // If symbol and name are identical and look like addresses
+        if (token.name === token.symbol && token.name?.length === 42) {
+            return true;
+        }
+    }
     
     return false;
 }
 
 function isSpamNFT(collection) {
+    // If it has a floor price, it's probably legitimate
+    if (collection.floorPrice > 0) return false;
+    
+    // Check against spam patterns
     for (const pattern of SPAM_PATTERNS.nfts) {
         if (pattern.test(collection.name)) {
             return true;
         }
     }
+    
+    // If collection has many NFTs, probably legitimate
+    if (collection.nfts.length >= 10) return false;
+    
     return false;
 }
 
@@ -231,24 +273,33 @@ app.get('/api/wallet/:addressOrEns', async (req, res) => {
             const chainResult = {
                 chain: chainId,
                 tokens: [],
-                success: false
+                success: false,
+                error: null
             };
             
             try {
-                // Race between fetch and timeout (2 seconds per chain)
+                console.log(`  🔍 Fetching ${config.emoji} ${config.name}...`);
+                
+                // Race between fetch and timeout (3 seconds per chain)
                 const tokens = await Promise.race([
                     fetchChainTokensFast(address, chainId),
-                    new Promise((resolve) => setTimeout(() => resolve([]), 2000))
+                    new Promise((resolve) => setTimeout(() => {
+                        console.log(`  ⏱️ ${config.name} timed out after 3s`);
+                        return resolve([]);
+                    }, 3000))
                 ]);
                 
                 chainResult.tokens = tokens;
                 chainResult.success = tokens.length > 0;
                 
                 if (tokens.length > 0) {
-                    console.log(`  ✓ ${config.emoji} ${config.name}: ${tokens.length} tokens`);
+                    console.log(`  ✅ ${config.emoji} ${config.name}: Found ${tokens.length} tokens`);
+                } else {
+                    console.log(`  ⚠️ ${config.emoji} ${config.name}: No tokens found`);
                 }
             } catch (error) {
-                console.log(`  ✗ ${config.emoji} ${config.name}: skipped (timeout)`);
+                console.log(`  ❌ ${config.emoji} ${config.name}: Error - ${error.message}`);
+                chainResult.error = error.message;
             }
             
             return chainResult;
@@ -278,10 +329,21 @@ app.get('/api/wallet/:addressOrEns', async (req, res) => {
         
         chainResults.forEach(result => {
             if (result.tokens.length > 0) {
-                // Filter out spam tokens
-                const validTokens = result.tokens.filter(t => !isSpamToken(t));
+                // Filter out only obvious spam tokens
+                const validTokens = result.tokens.filter(t => {
+                    const isSpam = isSpamToken(t);
+                    if (isSpam) {
+                        console.log(`  🚫 Filtered spam: ${t.name} (${t.symbol}) on ${t.chain}`);
+                    }
+                    return !isSpam;
+                });
+                
+                console.log(`  📊 ${result.chain}: ${result.tokens.length} total, ${validTokens.length} after filtering`);
+                
                 allTokens.push(...validTokens);
-                tokensByChain[result.chain] = validTokens;
+                if (validTokens.length > 0) {
+                    tokensByChain[result.chain] = validTokens;
+                }
             }
         });
         
@@ -337,112 +399,121 @@ async function fetchChainTokensFast(address, chainId) {
     const config = CHAINS[chainId];
     const provider = providers[chainId];
     
-    if (!provider) return [];
+    if (!provider) {
+        console.log(`    ⚠️ No provider for ${chainId}`);
+        return [];
+    }
     
     const tokens = [];
     
     try {
-        // Get native balance (super quick)
-        const balancePromise = provider.getBalance(address);
-        const balance = await Promise.race([
-            balancePromise,
-            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 1000))
-        ]);
-        
-        const formatted = ethers.formatEther(balance);
-        
-        if (parseFloat(formatted) > 0.000001) {
-            tokens.push({
-                name: config.nativeSymbol === 'ETH' ? `ETH on ${config.name}` : config.nativeSymbol,
-                symbol: config.nativeSymbol,
-                balance: formatted,
-                price: 0,
-                usdValue: 0,
-                chain: chainId,
-                chainName: config.name,
-                chainEmoji: config.emoji,
-                isNative: true,
-                logo: config.nativeSymbol === 'ETH' ? 
-                    'https://cryptologos.cc/logos/ethereum-eth-logo.png' :
-                    config.nativeSymbol === 'MATIC' ?
-                    'https://cryptologos.cc/logos/polygon-matic-logo.png' :
-                    config.nativeSymbol === 'BNB' ?
-                    'https://cryptologos.cc/logos/binance-coin-bnb-logo.png' :
-                    config.nativeSymbol === 'AVAX' ?
-                    'https://cryptologos.cc/logos/avalanche-avax-logo.png' :
-                    ''
-            });
-        }
-    } catch (error) {
-        // Skip native token if timeout
-    }
-    
-    // Get ERC-20 tokens
-    try {
-        const alchemyUrl = `https://${config.rpc}.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`;
-        
-        const response = await axios.post(alchemyUrl, {
-            jsonrpc: '2.0',
-            method: 'alchemy_getTokenBalances',
-            params: [address],
-            id: 1
-        }, {
-            timeout: 2000 // 2 second timeout
-        });
-        
-        if (response.data.result?.tokenBalances) {
-            const nonZeroBalances = response.data.result.tokenBalances
-                .filter(tb => tb.tokenBalance && tb.tokenBalance !== '0x0')
-                .slice(0, 50); // Limit to 50 tokens per chain for speed
+        // Get native balance first
+        try {
+            const balance = await provider.getBalance(address);
+            const formatted = ethers.formatEther(balance);
             
-            // Process in small batches
-            const batchSize = 5;
-            for (let i = 0; i < nonZeroBalances.length; i += batchSize) {
-                const batch = nonZeroBalances.slice(i, i + batchSize);
-                
-                const batchPromises = batch.map(async (tb) => {
-                    try {
-                        const metadataRes = await axios.post(alchemyUrl, {
-                            jsonrpc: '2.0',
-                            method: 'alchemy_getTokenMetadata',
-                            params: [tb.contractAddress],
-                            id: 1
-                        }, {
-                            timeout: 1000 // 1 second timeout
-                        });
-                        
-                        const metadata = metadataRes.data.result;
-                        if (!metadata) return null;
-                        
-                        const decimals = metadata.decimals || 18;
-                        const balance = ethers.formatUnits(tb.tokenBalance, decimals);
-                        
-                        if (parseFloat(balance) < 0.000000001) return null;
-                        
-                        return {
-                            name: metadata.name || 'Unknown',
-                            symbol: metadata.symbol || 'UNKNOWN',
-                            balance,
-                            decimals,
-                            contractAddress: tb.contractAddress,
-                            chain: chainId,
-                            chainName: config.name,
-                            chainEmoji: config.emoji,
-                            logo: metadata.logo || '',
-                            price: 0,
-                            usdValue: 0
-                        };
-                    } catch (err) {
-                        return null;
-                    }
+            if (parseFloat(formatted) > 0.000001) {
+                tokens.push({
+                    name: config.nativeSymbol === 'ETH' ? `ETH on ${config.name}` : config.nativeSymbol,
+                    symbol: config.nativeSymbol,
+                    balance: formatted,
+                    price: 0,
+                    usdValue: 0,
+                    chain: chainId,
+                    chainName: config.name,
+                    chainEmoji: config.emoji,
+                    isNative: true,
+                    logo: config.nativeSymbol === 'ETH' ? 
+                        'https://cryptologos.cc/logos/ethereum-eth-logo.png' :
+                        config.nativeSymbol === 'MATIC' ?
+                        'https://cryptologos.cc/logos/polygon-matic-logo.png' :
+                        config.nativeSymbol === 'BNB' ?
+                        'https://cryptologos.cc/logos/binance-coin-bnb-logo.png' :
+                        config.nativeSymbol === 'AVAX' ?
+                        'https://cryptologos.cc/logos/avalanche-avax-logo.png' :
+                        ''
                 });
-                
-                const results = await Promise.all(batchPromises);
-                tokens.push(...results.filter(t => t !== null));
+                console.log(`    ✓ ${config.emoji} ${config.nativeSymbol}: ${parseFloat(formatted).toFixed(6)}`);
             }
+        } catch (error) {
+            console.log(`    ⚠️ Failed to get native balance for ${chainId}:`, error.message);
+        }
+        
+        // Get ERC-20 tokens
+        try {
+            const alchemyUrl = `https://${config.rpc}.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`;
+            
+            const response = await axios.post(alchemyUrl, {
+                jsonrpc: '2.0',
+                method: 'alchemy_getTokenBalances',
+                params: [address],
+                id: 1
+            }, {
+                timeout: 3000
+            });
+            
+            if (response.data.result?.tokenBalances) {
+                const nonZeroBalances = response.data.result.tokenBalances
+                    .filter(tb => tb.tokenBalance && tb.tokenBalance !== '0x0' && tb.tokenBalance !== '0x')
+                    .slice(0, 100); // Increased limit to get more tokens
+                
+                console.log(`    📦 Found ${nonZeroBalances.length} token balances on ${config.name}`);
+                
+                // Process in batches
+                const batchSize = 10;
+                for (let i = 0; i < nonZeroBalances.length; i += batchSize) {
+                    const batch = nonZeroBalances.slice(i, i + batchSize);
+                    
+                    const batchPromises = batch.map(async (tb) => {
+                        try {
+                            const metadataRes = await axios.post(alchemyUrl, {
+                                jsonrpc: '2.0',
+                                method: 'alchemy_getTokenMetadata',
+                                params: [tb.contractAddress],
+                                id: 1
+                            }, {
+                                timeout: 2000
+                            });
+                            
+                            const metadata = metadataRes.data.result;
+                            if (!metadata || !metadata.symbol) return null;
+                            
+                            const decimals = metadata.decimals || 18;
+                            const balance = ethers.formatUnits(tb.tokenBalance, decimals);
+                            
+                            // Skip dust amounts
+                            if (parseFloat(balance) < 0.000000001) return null;
+                            
+                            return {
+                                name: metadata.name || 'Unknown Token',
+                                symbol: metadata.symbol || 'UNKNOWN',
+                                balance,
+                                decimals,
+                                contractAddress: tb.contractAddress,
+                                chain: chainId,
+                                chainName: config.name,
+                                chainEmoji: config.emoji,
+                                logo: metadata.logo || '',
+                                price: 0,
+                                usdValue: 0
+                            };
+                        } catch (err) {
+                            return null;
+                        }
+                    });
+                    
+                    const results = await Promise.all(batchPromises);
+                    const validResults = results.filter(t => t !== null);
+                    tokens.push(...validResults);
+                }
+                
+                console.log(`    ✅ Processed ${tokens.length} tokens on ${config.name}`);
+            }
+        } catch (error) {
+            console.log(`    ⚠️ Failed to get ERC-20 tokens for ${chainId}:`, error.message);
         }
     } catch (error) {
-        // Skip ERC-20 if error
+        console.log(`    ❌ Error fetching ${chainId} tokens:`, error.message);
     }
     
     return tokens;
@@ -454,77 +525,89 @@ async function fetchChainTokensFast(address, chainId) {
 
 async function fetchNFTsFast(address) {
     try {
+        console.log('  • Fetching NFTs...');
         const url = `https://eth-mainnet.g.alchemy.com/nft/v3/${process.env.ALCHEMY_API_KEY}/getNFTsForOwner`;
         
         const response = await axios.get(url, {
             params: {
                 owner: address,
                 withMetadata: true,
-                pageSize: 200,
-                orderBy: 'transferTime'
+                pageSize: 100
             },
             timeout: 5000
         });
         
-        const collections = {};
-        
-        if (response.data.ownedNfts) {
-            // Process NFTs into collections
-            response.data.ownedNfts.forEach(nft => {
-                // Skip obvious spam patterns
-                if (nft.contract.name && (
-                    nft.contract.name.includes('.com') ||
-                    nft.contract.name.includes('Visit ') ||
-                    nft.contract.name.includes('Free ') ||
-                    nft.contract.name.includes('Claim ')
-                )) return;
-                
-                const key = nft.contract.address;
-                
-                if (!collections[key]) {
-                    collections[key] = {
-                        name: nft.contract.name || 'Unknown',
-                        address: key,
-                        symbol: nft.contract.symbol,
-                        nfts: [],
-                        floorPrice: 0,
-                        totalValue: 0,
-                        openSeaSlug: nft.contract.openSeaMetadata?.collectionSlug || null
-                    };
-                }
-                
-                let image = nft.image?.thumbnailUrl || 
-                           nft.image?.cachedUrl || 
-                           nft.raw?.metadata?.image ||
-                           '';
-                
-                // Convert IPFS URLs to HTTP gateway
-                if (image && image.startsWith('ipfs://')) {
-                    image = `https://ipfs.io/ipfs/${image.slice(7)}`;
-                }
-                
-                collections[key].nfts.push({
-                    name: nft.name || nft.title || `#${nft.tokenId}`,
-                    tokenId: nft.tokenId,
-                    image,
-                    largeImage: nft.image?.cachedUrl || image,
-                    hasImage: !!image,
-                    description: nft.description
-                });
-            });
+        if (!response.data.ownedNfts || response.data.ownedNfts.length === 0) {
+            console.log('    No NFTs found');
+            return [];
         }
         
-        // Get floor prices for collections (parallel)
+        console.log(`    Found ${response.data.ownedNfts.length} NFTs`);
+        const collections = {};
+        
+        response.data.ownedNfts.forEach(nft => {
+            // Basic spam filter - skip obvious spam
+            const contractName = nft.contract.name || '';
+            if (contractName.toLowerCase().includes('.com') ||
+                contractName.toLowerCase().includes('visit ') ||
+                contractName.toLowerCase().includes('claim')) {
+                return;
+            }
+            
+            const key = nft.contract.address;
+            
+            if (!collections[key]) {
+                collections[key] = {
+                    name: nft.contract.name || 'Unknown Collection',
+                    address: key,
+                    symbol: nft.contract.symbol,
+                    nfts: [],
+                    floorPrice: 0,
+                    totalValue: 0
+                };
+            }
+            
+            // Get image URL
+            let image = nft.image?.thumbnailUrl || 
+                       nft.image?.cachedUrl || 
+                       nft.image?.originalUrl ||
+                       nft.media?.[0]?.thumbnail ||
+                       nft.media?.[0]?.gateway ||
+                       nft.metadata?.image ||
+                       '';
+            
+            // Convert IPFS URLs to HTTP gateway
+            if (image && image.startsWith('ipfs://')) {
+                image = `https://ipfs.io/ipfs/${image.slice(7)}`;
+            } else if (image && image.startsWith('ar://')) {
+                // Arweave URLs
+                image = `https://arweave.net/${image.slice(5)}`;
+            }
+            
+            collections[key].nfts.push({
+                name: nft.name || nft.title || `#${nft.tokenId}`,
+                tokenId: nft.tokenId,
+                image,
+                largeImage: nft.image?.originalUrl || nft.image?.cachedUrl || image,
+                hasImage: !!image,
+                description: nft.description || ''
+            });
+        });
+        
+        console.log(`    Organized into ${Object.keys(collections).length} collections`);
+        
+        // Get floor prices for collections
         const collectionArray = Object.values(collections);
+        
+        // Try to get floor prices (but don't let this block NFT display)
         const floorPricePromises = collectionArray.map(async (collection) => {
             try {
-                // Try to get floor price from Alchemy
                 const floorUrl = `https://eth-mainnet.g.alchemy.com/nft/v3/${process.env.ALCHEMY_API_KEY}/getFloorPrice`;
                 const floorResponse = await axios.get(floorUrl, {
                     params: {
                         contractAddress: collection.address
                     },
-                    timeout: 2000
+                    timeout: 1500
                 });
                 
                 if (floorResponse.data?.openSea?.floorPrice) {
@@ -537,46 +620,29 @@ async function fetchNFTsFast(address) {
                     collection.marketplace = 'LooksRare';
                 }
             } catch (error) {
-                // Silently fail for individual floor price fetches
+                // Silently fail for individual floor prices
             }
         });
         
-        // Wait for all floor prices (with timeout)
+        // Wait for floor prices but with a short timeout
         await Promise.race([
             Promise.all(floorPricePromises),
-            new Promise(resolve => setTimeout(resolve, 3000))
+            new Promise(resolve => setTimeout(resolve, 2000))
         ]);
         
-        // Filter out collections with no floor price (likely spam)
-        // BUT keep collections with many NFTs even without floor price
-        const validCollections = collectionArray.filter(collection => {
-            // Keep if has floor price
-            if (collection.floorPrice > 0) return true;
-            // Keep if has 5+ NFTs (likely legitimate collection)
-            if (collection.nfts.length >= 5) return true;
-            // Keep if it's a known legitimate collection name pattern
-            if (collection.name && (
-                collection.name.includes('ENS') ||
-                collection.name.includes('Lens') ||
-                collection.name.includes('POAP') ||
-                collection.name.includes('Uniswap') ||
-                collection.name.includes('CryptoPunks') ||
-                collection.name.includes('Bored Ape') ||
-                collection.name.includes('Azuki') ||
-                collection.name.includes('Doodles') ||
-                collection.name.includes('Moonbirds')
-            )) return true;
-            // Otherwise, only keep if has at least 1 NFT with an image
-            return collection.nfts.some(nft => nft.hasImage);
+        // Sort collections: ones with floor prices first, then by NFT count
+        collectionArray.sort((a, b) => {
+            if (a.floorPrice && !b.floorPrice) return -1;
+            if (!a.floorPrice && b.floorPrice) return 1;
+            if (a.floorPrice && b.floorPrice) return b.totalValue - a.totalValue;
+            return b.nfts.length - a.nfts.length;
         });
         
-        // Sort by total value (collections with floor prices first)
-        validCollections.sort((a, b) => (b.totalValue || 0) - (a.totalValue || 0));
-        
-        return validCollections;
+        console.log(`    Returning ${collectionArray.length} collections`);
+        return collectionArray;
         
     } catch (error) {
-        console.error('NFT fetch error:', error);
+        console.error('  ❌ NFT fetch error:', error.message);
         return [];
     }
 }
@@ -711,15 +777,31 @@ const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 eth.af Backend v9.0 - ULTRA FAST EDITION`);
     console.log(`📡 Port: ${PORT}`);
     console.log(`⏰ Started: ${new Date().toISOString()}`);
+    console.log(`\n🔑 API Keys:`);
+    console.log(`  • Alchemy: ${process.env.ALCHEMY_API_KEY ? '✅ ' + process.env.ALCHEMY_API_KEY.substring(0, 10) + '...' : '❌ MISSING'}`);
+    console.log(`  • Etherscan: ${process.env.ETHERSCAN_API_KEY ? '✅' : '❌'}`);
     console.log(`\n⛓️ Active Chains (${Object.keys(CHAINS).length}):`);
+    
+    // Specifically check for Ethereum and Base
     Object.entries(CHAINS).forEach(([id, config]) => {
-        console.log(`  ${config.emoji} ${config.name}`);
+        const hasProvider = !!providers[id];
+        const status = hasProvider ? '✅' : '❌';
+        console.log(`  ${status} ${config.emoji} ${config.name} (${id})`);
     });
+    
+    // Extra check for critical chains
+    if (!providers.ethereum) {
+        console.log('\n⚠️ WARNING: Ethereum provider not initialized!');
+    }
+    if (!providers.base) {
+        console.log('⚠️ WARNING: Base provider not initialized!');
+    }
+    
     console.log(`\n⚡ Optimizations:`);
     console.log(`  • Parallel chain fetching`);
     console.log(`  • 1-3 second timeouts`);
-    console.log(`  • Spam filtering`);
-    console.log(`  • Response streaming`);
+    console.log(`  • Smart spam filtering`);
+    console.log(`  • NFT floor prices`);
     console.log(`${'='.repeat(60)}\n`);
 });
 
